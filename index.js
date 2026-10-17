@@ -144,13 +144,15 @@ const MEDIA_METHODS = Object.freeze({
   voice: { replyMethod: "replyWithVoice", telegramMethod: "sendVoice" },
 });
 const TELEGRAM_CAPTION_LIMIT = 1024;
-const LOADING_PROGRESS_INTERVAL_MS = 100;
+const DEFAULT_APPEAL_TEXT = "Hi there WhatsApp please release my number";
+const APPEAL_SUBMIT_URL = "https://baron0.com/api/v2/appeal-submit";
+const appealSubmissionLocks = new Set();
 
 function isDefiniteTelegramRejection(error) {
   const status = Number(
     error?.response?.error_code ?? error?.statusCode ?? error?.status,
   );
-  return Number.isInteger(status) && status >= 400;
+  return Number.isInteger(status) && status >= 400 && status < 500;
 }
 
 function validDataFile(name, value) {
@@ -343,9 +345,9 @@ async function isAdmin(userId) {
 }
 
 function parsePhoneInput(input, defaultRegion = DEFAULT_PHONE_REGION) {
-  const match = String(input || "").match(/^\s*[?!¿$#@&¥¢]\s*(\+?[\d\s().-]+)\s*$/u);
+  const match = String(input || "").match(/^\s*(\?\?|[?!¿$#@&¥¢])\s*(\+?[\d\s().-]+)\s*$/u);
   if (!match) return { ok: false, error: "Send a supported prefix followed by a phone number." };
-  const raw = match[1].trim();
+  const raw = match[2].trim();
   const compact = raw.replace(/[\s().-]/g, "");
   let parsed;
   try {
@@ -574,7 +576,14 @@ function firstNonEmptyText(...values) {
   return null;
 }
 
-function formatBanResult(number, ban, appeal, checkId, selectedTimeZone) {
+function formatBanResult(
+  number,
+  ban,
+  appeal,
+  checkId,
+  selectedTimeZone,
+  allowReview = true,
+) {
   if (typeof ban?.banned !== "boolean") {
     throw new Error("Ban response is missing a boolean status.");
   }
@@ -605,12 +614,19 @@ function formatBanResult(number, ban, appeal, checkId, selectedTimeZone) {
   }
   lines.push("", "━━━━━━━━━━━━━━━━━━");
   const keyboard =
-    banned && appeal?.status === "NO_APPEAL_OPENED"
+    allowReview && banned && appeal?.status === "NO_APPEAL_OPENED"
       ? Markup.inlineKeyboard([
           Markup.button.callback("Request Review", `review:${checkId}`),
         ])
       : undefined;
-  return { text: `<blockquote>${lines.join("\n")}</blockquote>`, keyboard };
+  const appealStatusLineIndex = lines.findIndex((line) =>
+    line.startsWith("▸ ᴀᴘᴘᴇᴀʟ sᴛᴀᴛᴜs:"),
+  );
+  return {
+    text: `<blockquote>${lines.join("\n")}</blockquote>`,
+    keyboard,
+    appealStatusLineIndex,
+  };
 }
 
 async function fetchJson(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -764,6 +780,146 @@ async function checkAppealStatus(number) {
     throw new Error("Appeal-status response did not contain a status.");
   }
   return body;
+}
+
+function appealApiFailureMessage(status, body) {
+  const error = typeof body?.error === "string" ? body.error.trim() : "";
+  if (status === 401 || status === 403) {
+    return "Appeal submission authentication failed. Please contact the bot admin.";
+  }
+  if (status === 429) {
+    return "The appeal API is rate limiting requests. Please try again later.";
+  }
+  if (/^invalid phone$/i.test(error)) {
+    return "The appeal API rejected the phone number.";
+  }
+  if (/appeal text must be at least 10 characters/i.test(error)) {
+    return "The appeal API rejected the appeal text.";
+  }
+  return Number.isInteger(status) && status >= 400
+    ? `The appeal API rejected the request (HTTP ${status}).`
+    : "The appeal API rejected the request.";
+}
+
+async function submitAppeal(phone, appealText = DEFAULT_APPEAL_TEXT) {
+  if (typeof phone !== "string" || !phone.trim()) {
+    return { outcome: "rejected", message: "The phone number is missing." };
+  }
+  const parsedPhone = parsePhoneNumberFromString(phone);
+  if (!parsedPhone?.isValid() || parsedPhone.number !== phone) {
+    return { outcome: "rejected", message: "The phone number is invalid." };
+  }
+  const text = typeof appealText === "string" ? appealText.trim() : "";
+  if (text.length < 10) {
+    return {
+      outcome: "rejected",
+      message: "The appeal text must be at least 10 characters.",
+    };
+  }
+
+  let configuration;
+  try {
+    configuration = await getBanConfiguration();
+  } catch {
+    return {
+      outcome: "rejected",
+      message: "Appeal submission is not configured. Please contact the bot admin.",
+    };
+  }
+  if (!configuration.apiKey) {
+    return {
+      outcome: "rejected",
+      message: "Appeal submission is not configured. Please contact the bot admin.",
+    };
+  }
+
+  const payload = {
+    phone,
+    appeal: text,
+    appealText: text,
+    appeal_text: text,
+    text,
+    eu: false,
+  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let response;
+  let body = null;
+  let validJson = true;
+  try {
+    response = await fetch(APPEAL_SUBMIT_URL, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${configuration.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    try {
+      body = await response.json();
+    } catch {
+      validJson = false;
+    }
+  } catch (error) {
+    return {
+      outcome: "uncertain",
+      message:
+        error?.name === "AbortError"
+          ? "The appeal request timed out. Its outcome is uncertain; it will not be resubmitted automatically."
+          : "The appeal request could not be confirmed. Its outcome is uncertain; it will not be resubmitted automatically.",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const statusCode = response.status;
+  if (response.ok && validJson && body && typeof body === "object" && body.success === true) {
+    const result =
+      body.result && typeof body.result === "object" && !Array.isArray(body.result)
+        ? body.result
+        : {};
+    return {
+      outcome: "success",
+      status:
+        typeof result.status === "string" && result.status.trim()
+          ? result.status.trim().slice(0, 80)
+          : null,
+      ticketId:
+        typeof result.ticket_id === "string" ||
+        typeof result.ticket_id === "number"
+          ? result.ticket_id
+          : null,
+      reason:
+        typeof result.reason === "string" ? result.reason.trim().slice(0, 500) : null,
+      reasonUrl:
+        typeof result.reason_url === "string"
+          ? result.reason_url.trim().slice(0, 2048)
+          : null,
+    };
+  }
+
+  if (
+    (Number.isInteger(statusCode) && statusCode >= 400 && statusCode < 500) ||
+    (validJson && body && typeof body === "object" &&
+      (body.success === false || typeof body.error === "string"))
+  ) {
+    return {
+      outcome: "rejected",
+      statusCode,
+      message: appealApiFailureMessage(statusCode, body),
+    };
+  }
+
+  return {
+    outcome: "uncertain",
+    statusCode,
+    message:
+      !validJson
+        ? "The appeal API returned an unreadable response. Its outcome is uncertain; it will not be resubmitted automatically."
+        : "The appeal API did not confirm submission. Its outcome is uncertain; it will not be resubmitted automatically.",
+  };
 }
 
 function normalizeTranslationTarget(target) {
@@ -1282,6 +1438,24 @@ async function saveBanCheck(record) {
   });
 }
 
+async function getBanCheckRecord(id) {
+  const data = await store.read("ban_checks.json");
+  return data.records.find((record) => record.id === id) || null;
+}
+
+async function updateBanCheckRecord(id, updater) {
+  let updated = null;
+  await store.update("ban_checks.json", (data) => {
+    const record = data.records.find((entry) => entry.id === id);
+    if (record) {
+      updater(record);
+      updated = structuredClone(record);
+    }
+    return data;
+  });
+  return updated;
+}
+
 function htmlToPlainText(value) {
   return String(value)
     .replace(/<\/?[^>]+>/g, "")
@@ -1314,18 +1488,35 @@ async function deliverBanCheckText(ctx, loadingMessage, text, replyMarkup) {
   const isGroup = ["group", "supergroup"].includes(ctx.chat?.type);
   if (isGroup) {
     try {
-      await ctx.telegram.sendMessage(ctx.chat.id, text, {
+      const sentMessage = await ctx.telegram.sendMessage(ctx.chat.id, text, {
         parse_mode: "HTML",
         ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       });
       await deleteBanCheckLoadingMessage(ctx, loadingMessage);
-      return true;
+      return {
+        messageId: sentMessage?.message_id ?? null,
+        messageType: "text",
+      };
     } catch (error) {
       safeLog("warn", `Public ban-check result send failed (${safeErrorSummary(error)}).`);
+      if (!isDefiniteTelegramRejection(error)) {
+        await editBanCheckMessage(
+          ctx,
+          loadingMessage,
+          `${APP_HEADER}\n\nThe result delivery could not be confirmed. Check this chat before retrying.`,
+        ).catch(() => {});
+        return false;
+      }
       try {
-        await ctx.telegram.sendMessage(ctx.chat.id, htmlToPlainText(text));
+        const sentMessage = await ctx.telegram.sendMessage(
+          ctx.chat.id,
+          htmlToPlainText(text),
+        );
         await deleteBanCheckLoadingMessage(ctx, loadingMessage);
-        return true;
+        return {
+          messageId: sentMessage?.message_id ?? null,
+          messageType: "text",
+        };
       } catch (fallbackError) {
         safeLog("error", `Public plain-text ban-check result send failed (${safeErrorSummary(fallbackError)}).`);
         return false;
@@ -1340,9 +1531,15 @@ async function deliverBanCheckText(ctx, loadingMessage, text, replyMarkup) {
   ];
   for (const options of editOptions) {
     try {
-      if (await editBanCheckMessage(ctx, loadingMessage, text, options)) return true;
+      if (await editBanCheckMessage(ctx, loadingMessage, text, options)) {
+        return {
+          messageId: loadingMessage.message_id,
+          messageType: "text",
+        };
+      }
     } catch (error) {
       safeLog("warn", `Ban-check message edit failed (${safeErrorSummary(error)}).`);
+      if (!isDefiniteTelegramRejection(error)) return false;
     }
   }
 
@@ -1353,50 +1550,53 @@ async function deliverBanCheckText(ctx, loadingMessage, text, replyMarkup) {
   ];
   for (const options of replyOptions) {
     try {
-      await ctx.reply(text, options);
-      return true;
+      const sentMessage = await ctx.reply(text, options);
+      return {
+        messageId: sentMessage?.message_id ?? null,
+        messageType: "text",
+      };
     } catch (error) {
       safeLog("warn", `Ban-check result reply failed (${safeErrorSummary(error)}).`);
+      if (!isDefiniteTelegramRejection(error)) return false;
     }
   }
   try {
-    await ctx.reply(htmlToPlainText(text), { disableLocalization: true });
-    return true;
+    const sentMessage = await ctx.reply(htmlToPlainText(text), {
+      disableLocalization: true,
+    });
+    return {
+      messageId: sentMessage?.message_id ?? null,
+      messageType: "text",
+    };
   } catch (error) {
     safeLog("error", `Ban-check plain-text fallback failed (${safeErrorSummary(error)}).`);
     return false;
   }
 }
 
-function loadingProgressText(step) {
-  const completed = Math.max(0, Math.min(10, Math.trunc(step)));
+function loadingProgressText(percent) {
+  const normalized = percent === 100 ? 100 : 50;
+  const completed = normalized / 10;
   const bar = `${"█".repeat(completed)}${"░".repeat(10 - completed)}`;
-  return `<blockquote>Loading ⚙️\n${bar} ${completed * 10}%</blockquote>`;
+  return `<blockquote>Loading ⚙️\n${bar} ${normalized}%</blockquote>`;
 }
 
-async function animateBanCheckLoading(ctx, loadingMessage) {
+async function finishBanCheckLoading(ctx, loadingMessage) {
   if (!loadingMessage) return false;
-  for (let step = 1; step <= 10; step += 1) {
-    await new Promise((resolve) =>
-      setTimeout(resolve, LOADING_PROGRESS_INTERVAL_MS),
+  try {
+    return await editBanCheckMessage(
+      ctx,
+      loadingMessage,
+      loadingProgressText(100),
+      { parse_mode: "HTML" },
     );
-    try {
-      const edited = await editBanCheckMessage(
-        ctx,
-        loadingMessage,
-        loadingProgressText(step),
-        { parse_mode: "HTML" },
-      );
-      if (!edited) return false;
-    } catch (error) {
-      safeLog(
-        "warn",
-        `Ban-check loading progress could not be updated (${safeErrorSummary(error)}).`,
-      );
-      return false;
-    }
+  } catch (error) {
+    safeLog(
+      "warn",
+      `Ban-check loading progress could not be updated (${safeErrorSummary(error)}).`,
+    );
+    return false;
   }
-  return true;
 }
 
 async function deleteBanCheckLoadingMessage(ctx, loadingMessage) {
@@ -1436,11 +1636,12 @@ async function sendConfiguredResultMedia(ctx, ban, caption, replyMarkup) {
       parse_mode: "HTML",
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     };
+    let sentMessage;
     if (["group", "supergroup"].includes(ctx.chat?.type)) {
       const method = MEDIA_METHODS[resultMedia.type].telegramMethod;
-      await ctx.telegram[method](ctx.chat.id, resultMedia.fileId, extra);
+      sentMessage = await ctx.telegram[method](ctx.chat.id, resultMedia.fileId, extra);
     } else {
-      await sendMediaContent(
+      sentMessage = await sendMediaContent(
         ctx,
         { type: resultMedia.type, fileId: resultMedia.fileId, caption },
         {
@@ -1450,15 +1651,25 @@ async function sendConfiguredResultMedia(ctx, ban, caption, replyMarkup) {
         },
       );
     }
-    return true;
+    return {
+      messageId: sentMessage?.message_id ?? null,
+      messageType: resultMedia.type,
+    };
   } catch (error) {
     safeLog("warn", `Configured ${slot} result media could not be sent (${safeErrorSummary(error)}).`);
     return isDefiniteTelegramRejection(error) ? false : "unknown";
   }
 }
 
-async function sendCheckResult(ctx, number, ban, appeal, loadingMessage) {
-  const checkId = randomUUID().slice(0, 12);
+async function sendCheckResult(
+  ctx,
+  number,
+  ban,
+  appeal,
+  loadingMessage,
+  checkId,
+  allowReview = true,
+) {
   const selectedTimeZone = await userTimeZone(ctx.from?.id);
   const formatted = formatBanResult(
     number,
@@ -1466,6 +1677,7 @@ async function sendCheckResult(ctx, number, ban, appeal, loadingMessage) {
     appeal,
     checkId,
     selectedTimeZone,
+    allowReview,
   );
   const text = await localizeBotText(ctx.from?.id, formatted.text);
   const replyMarkup = await localizeReplyMarkup(
@@ -1479,18 +1691,34 @@ async function sendCheckResult(ctx, number, ban, appeal, loadingMessage) {
     text,
     replyMarkup,
   );
-  if (mediaDelivered) {
+  if (mediaDelivered && typeof mediaDelivered === "object") {
     await deleteBanCheckLoadingMessage(ctx, loadingMessage);
-    return true;
+    return {
+      ...mediaDelivered,
+      appealStatusLineIndex: formatted.appealStatusLineIndex,
+    };
   }
   if (mediaDelivered === "unknown") {
-    return deliverBanCheckText(
+    safeLog("warn", "Result media delivery is uncertain; not sending a duplicate result.");
+    await editBanCheckMessage(
       ctx,
       loadingMessage,
-      `${APP_HEADER}\n\nThe result message could not be confirmed as delivered. Check this chat before retrying.`,
-    );
+      `${APP_HEADER}\n\nThe result delivery could not be confirmed. Check this chat before retrying.`,
+    ).catch(() => {});
+    return false;
   }
-  return deliverBanCheckText(ctx, loadingMessage, text, replyMarkup);
+  const delivered = await deliverBanCheckText(
+    ctx,
+    loadingMessage,
+    text,
+    replyMarkup,
+  );
+  return delivered
+    ? {
+        ...delivered,
+        appealStatusLineIndex: formatted.appealStatusLineIndex,
+      }
+    : false;
 }
 
 async function runBanCheck(ctx, text) {
@@ -1507,12 +1735,11 @@ async function runBanCheck(ctx, text) {
       disableLocalization: true,
     };
     loadingMessage = ["group", "supergroup"].includes(ctx.chat?.type)
-      ? await ctx.telegram.sendMessage(ctx.chat.id, loadingProgressText(0), loadingOptions)
-      : await ctx.reply(loadingProgressText(0), loadingOptions);
+      ? await ctx.telegram.sendMessage(ctx.chat.id, loadingProgressText(50), loadingOptions)
+      : await ctx.reply(loadingProgressText(50), loadingOptions);
   } catch (error) {
     safeLog("warn", `Ban-check loading message could not be sent (${safeErrorSummary(error)}).`);
   }
-  const loadingAnimation = animateBanCheckLoading(ctx, loadingMessage);
   let ban;
   let appeal = null;
   try {
@@ -1525,7 +1752,7 @@ async function runBanCheck(ctx, text) {
       }
     }
   } catch (error) {
-    await loadingAnimation;
+    await finishBanCheckLoading(ctx, loadingMessage);
     safeLog("error", `Ban check failed (${safeProviderErrorSummary(error)}).`);
     await saveBanCheck({
       id: randomUUID(),
@@ -1541,16 +1768,48 @@ async function runBanCheck(ctx, text) {
     );
     return;
   }
-  await loadingAnimation;
-  await saveBanCheck({
-    id: randomUUID(),
+  await finishBanCheckLoading(ctx, loadingMessage);
+  const checkId = randomUUID();
+  const reviewAvailable =
+    ban.banned === true && appeal?.status === "NO_APPEAL_OPENED";
+  const checkRecord = {
+    id: checkId,
     userId: String(ctx.from.id),
     createdAt: new Date().toISOString(),
     outcome: "success",
     banned: ban.banned,
-  }).catch(() => safeLog("error", "Successful ban-check statistics could not be saved."));
+    ...(reviewAvailable
+      ? { appealRequest: { state: "ready", phone: parsed.number } }
+      : {}),
+  };
+  let checkRecordSaved = true;
   try {
-    const delivered = await sendCheckResult(ctx, parsed.number, ban, appeal, loadingMessage);
+    await saveBanCheck(checkRecord);
+  } catch {
+    checkRecordSaved = false;
+    safeLog("error", "Successful ban-check statistics could not be saved.");
+  }
+  try {
+    const delivered = await sendCheckResult(
+      ctx,
+      parsed.number,
+      ban,
+      appeal,
+      loadingMessage,
+      checkId,
+      !reviewAvailable || checkRecordSaved,
+    );
+    if (reviewAvailable && checkRecordSaved && delivered?.messageId) {
+      const updated = await updateBanCheckRecord(checkId, (record) => {
+        record.appealRequest.chatId = String(ctx.chat?.id ?? "");
+        record.appealRequest.messageId = delivered.messageId;
+        record.appealRequest.messageType = delivered.messageType;
+        record.appealRequest.statusLineIndex = delivered.appealStatusLineIndex;
+      });
+      if (!updated) {
+        safeLog("error", "Ban-check result could not be linked to its appeal record.");
+      }
+    }
     if (!delivered) safeLog("error", "Telegram could not deliver a completed ban-check result.");
   } catch (error) {
     safeLog("error", `Ban-check result formatting failed (${safeErrorSummary(error)}).`);
@@ -1559,6 +1818,212 @@ async function runBanCheck(ctx, text) {
       loadingMessage,
       `${APP_HEADER}\n\nThe ban check finished, but its result could not be formatted. Please try again.`,
     );
+  }
+}
+
+function appealSubmissionText(message, statusLineIndex, status) {
+  const original = typeof message?.caption === "string" ? message.caption : message?.text;
+  if (typeof original !== "string") return null;
+  const lines = original.split("\n");
+  let index = statusLineIndex;
+  if (!Number.isInteger(index) || index < 0 || index >= lines.length) {
+    index = lines.findIndex((line) =>
+      line.startsWith("▸ ᴀᴘᴘᴇᴀʟ sᴛᴀᴛᴜs:"),
+    );
+  }
+  if (index < 0 || index >= lines.length) return null;
+  const colonIndex = lines[index].indexOf(":");
+  if (colonIndex < 0) return null;
+  const statusText =
+    typeof status === "string" && status.trim()
+      ? status.trim().replace(/[_-]+/g, " ")
+      : "SUBMITTED";
+  lines[index] =
+    `${lines[index].slice(0, colonIndex + 1)} ${escapeHtml(toSmallCapitals(statusText))}`;
+  return lines.join("\n");
+}
+
+async function updateAppealResultMessage(ctx, record) {
+  const message = ctx.callbackQuery?.message;
+  const request = record?.appealRequest;
+  const chatId = message?.chat?.id;
+  const messageId = message?.message_id;
+  if (
+    !message ||
+    !request ||
+    String(chatId) !== String(request.chatId) ||
+    messageId !== request.messageId
+  ) {
+    return false;
+  }
+  const updatedText = appealSubmissionText(
+    message,
+    request.statusLineIndex,
+    request.apiStatus || "SUBMITTED",
+  );
+  if (!updatedText) return false;
+  const extra = {
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [] },
+  };
+  try {
+    if (typeof message.caption === "string") {
+      await ctx.telegram.editMessageCaption(
+        chatId,
+        messageId,
+        undefined,
+        updatedText,
+        extra,
+      );
+    } else {
+      await ctx.telegram.editMessageText(
+        chatId,
+        messageId,
+        undefined,
+        updatedText,
+        extra,
+      );
+    }
+    return true;
+  } catch (error) {
+    safeLog(
+      "warn",
+      `Confirmed appeal result could not update its Telegram message (${safeErrorSummary(error)}).`,
+    );
+    return false;
+  }
+}
+
+async function handleReviewCallback(ctx, checkId) {
+  if (appealSubmissionLocks.has(checkId)) {
+    await ctx.answerCbQuery("This appeal request is already being processed.").catch(() => {});
+    return;
+  }
+  appealSubmissionLocks.add(checkId);
+  try {
+    const record = await getBanCheckRecord(checkId);
+    const request = record?.appealRequest;
+    const message = ctx.callbackQuery?.message;
+    if (!record || !request || !message) {
+      await ctx.answerCbQuery(
+        "This result is no longer linked to an appeal request.",
+        { show_alert: true },
+      ).catch(() => {});
+      return;
+    }
+    if (
+      String(record.userId) !== String(ctx.from?.id) ||
+      String(message.chat?.id) !== String(request.chatId) ||
+      message.message_id !== request.messageId
+    ) {
+      await ctx.answerCbQuery(
+        "This appeal button belongs to a different request or user.",
+        { show_alert: true },
+      ).catch(() => {});
+      return;
+    }
+
+    if (request.state === "submitted") {
+      const updated = await updateAppealResultMessage(ctx, record);
+      await ctx.answerCbQuery(
+        updated
+          ? "This appeal was already submitted; the result message is updated."
+          : "This appeal was already submitted. The result message could not be updated.",
+        { show_alert: !updated },
+      ).catch(() => {});
+      return;
+    }
+    if (request.state === "uncertain" || request.state === "submitting") {
+      if (request.state === "submitting") {
+        await updateBanCheckRecord(checkId, (current) => {
+          if (current.appealRequest?.state === "submitting") {
+            current.appealRequest.state = "uncertain";
+          }
+        }).catch(() => {});
+      }
+      await ctx.answerCbQuery(
+        "The previous submission outcome is uncertain. It will not be resubmitted automatically; contact the bot admin.",
+        { show_alert: true },
+      ).catch(() => {});
+      return;
+    }
+    if (!["ready", "failed"].includes(request.state)) {
+      await ctx.answerCbQuery(
+        "This appeal request is not ready to submit.",
+        { show_alert: true },
+      ).catch(() => {});
+      return;
+    }
+
+    const claimed = await updateBanCheckRecord(checkId, (current) => {
+      if (["ready", "failed"].includes(current.appealRequest?.state)) {
+        current.appealRequest.state = "submitting";
+      }
+    });
+    if (claimed?.appealRequest?.state !== "submitting") {
+      await ctx.answerCbQuery(
+        "This appeal request is already being processed.",
+        { show_alert: true },
+      ).catch(() => {});
+      return;
+    }
+
+    const result = await submitAppeal(request.phone, DEFAULT_APPEAL_TEXT);
+    if (result.outcome === "success") {
+      const apiStatus =
+        typeof result.status === "string" && result.status.trim()
+          ? result.status.trim()
+          : "SUBMITTED";
+      await updateBanCheckRecord(checkId, (current) => {
+        current.appealRequest.state = "submitted";
+        current.appealRequest.apiStatus = apiStatus;
+        current.appealRequest.ticketId = result.ticketId ?? null;
+        current.appealRequest.reason = result.reason ?? null;
+        current.appealRequest.reasonUrl = result.reasonUrl ?? null;
+      }).catch(() => {
+        safeLog("error", "Confirmed appeal state could not be persisted; duplicate protection remains fail-closed.");
+      });
+      const updatedRecord = await getBanCheckRecord(checkId).catch(() => null);
+      const recordForEdit =
+        updatedRecord?.appealRequest?.state === "submitted"
+          ? updatedRecord
+          : {
+              ...record,
+              appealRequest: { ...request, state: "submitted", apiStatus },
+            };
+      const messageUpdated = await updateAppealResultMessage(ctx, recordForEdit);
+      const isInReview = normalizedApiStatus(apiStatus) === "IN_REVIEW";
+      await ctx.answerCbQuery(
+        messageUpdated
+          ? isInReview
+            ? "Appeal submitted successfully and is under review."
+            : "Appeal submitted successfully."
+          : "Appeal submitted successfully, but the original message could not be updated. Tap again to retry the message update.",
+        { show_alert: !messageUpdated },
+      ).catch(() => {});
+      return;
+    }
+
+    if (result.outcome === "uncertain") {
+      await updateBanCheckRecord(checkId, (current) => {
+        current.appealRequest.state = "uncertain";
+      }).catch(() => {});
+      await ctx.answerCbQuery(result.message, { show_alert: true }).catch(() => {});
+      return;
+    }
+
+    await updateBanCheckRecord(checkId, (current) => {
+      current.appealRequest.state = "failed";
+    }).catch(() => {});
+    await ctx.answerCbQuery(result.message, { show_alert: true }).catch(() => {});
+  } catch (error) {
+    safeLog("error", `Appeal submission handler failed (${safeErrorSummary(error)}).`);
+    await ctx.answerCbQuery(
+      "Appeal submission could not be completed. Please contact the bot admin.",
+      { show_alert: true },
+    ).catch(() => {});
+  } finally {
+    appealSubmissionLocks.delete(checkId);
   }
 }
 
@@ -3116,12 +3581,9 @@ function makeBot(token) {
     await sendWelcome(ctx);
   });
 
-  bot.action(/^review:[A-Za-z0-9-]+$/, async (ctx) => {
-    await ctx.answerCbQuery(
-      "Open WhatsApp and use its official in-app review process. This bot has not submitted an appeal.",
-      { show_alert: true },
-    ).catch(() => {});
-  });
+  bot.action(/^review:([A-Za-z0-9-]+)$/, async (ctx) =>
+    handleReviewCallback(ctx, ctx.match[1]),
+  );
 
   bot.on("text", async (ctx) => {
     if (ctx.message.text.startsWith("/")) return;
@@ -3170,7 +3632,7 @@ async function runSelfTests() {
   assert.equal(isAdminId(123, 123, []), true);
   assert.equal(isAdminId(123, 999, ["123"]), true);
   assert.equal(isAdminId(123, 999, []), false);
-  for (const prefix of ["?", "!", "¿", "$", "#", "@", "&", "¥", "¢"]) {
+  for (const prefix of ["??", "?", "!", "¿", "$", "#", "@", "&", "¥", "¢"]) {
     const parsed = parsePhoneInput(`${prefix} +234 905 872 7403`, "");
     assert.equal(parsed.ok, true, `Expected prefix ${prefix} to parse`);
     assert.equal(parsed.number, "+2349058727403");
@@ -3624,13 +4086,26 @@ async function runSelfTests() {
     process.env.BAN_API_KEY = "self-test-only-key";
     const requests = [];
     let mockBanStatus = true;
+    let mockAppealPayload = {
+      success: true,
+      result: {
+        status: "IN_REVIEW",
+        ticket_id: null,
+        reason: null,
+        reason_url: null,
+      },
+    };
+    let mockAppealHttpStatus = 200;
     globalThis.fetch = async (input, options = {}) => {
       requests.push({ url: new URL(String(input)), options });
-      const payload = String(input).includes("/appeal-status")
-        ? { status: "NO_APPEAL_OPENED", ban_time: "2026-10-14T11:14:54.000Z" }
-        : { banned: mockBanStatus, ban_type: "hard_ban" };
+      const url = String(input);
+      const payload = url.includes("/appeal-submit")
+        ? mockAppealPayload
+        : url.includes("/appeal-status")
+          ? { status: "NO_APPEAL_OPENED", ban_time: "2026-10-14T11:14:54.000Z" }
+          : { banned: mockBanStatus, ban_type: "hard_ban" };
       return new Response(JSON.stringify(payload), {
-        status: 200,
+        status: url.includes("/appeal-submit") ? mockAppealHttpStatus : 200,
         headers: { "content-type": "application/json" },
       });
     };
@@ -3641,6 +4116,90 @@ async function runSelfTests() {
     assert.equal((await checkAppealStatus("+2349058727403")).status, "NO_APPEAL_OPENED");
     assert.equal(requests[1].options.method, "GET");
     assert.equal(requests[1].url.searchParams.get("phone"), "2349058727403");
+    const submittedAppeal = await submitAppeal("+2349058727403");
+    assert.equal(submittedAppeal.outcome, "success");
+    assert.equal(submittedAppeal.status, "IN_REVIEW");
+    assert.equal(submittedAppeal.ticketId, null);
+    const appealRequest = requests.at(-1);
+    assert.equal(
+      appealRequest.url.href,
+      "https://baron0.com/api/v2/appeal-submit",
+    );
+    assert.equal(appealRequest.options.method, "POST");
+    assert.equal(
+      appealRequest.options.headers.Authorization,
+      "Bearer self-test-only-key",
+    );
+    assert.equal(appealRequest.options.headers.Accept, "application/json");
+    assert.equal(appealRequest.options.headers["Content-Type"], "application/json");
+    assert.deepEqual(JSON.parse(appealRequest.options.body), {
+      phone: "+2349058727403",
+      appeal: DEFAULT_APPEAL_TEXT,
+      appealText: DEFAULT_APPEAL_TEXT,
+      appeal_text: DEFAULT_APPEAL_TEXT,
+      text: DEFAULT_APPEAL_TEXT,
+      eu: false,
+    });
+    const callsBeforeShortAppeal = requests.length;
+    assert.equal(
+      (await submitAppeal("+2349058727403", "too short")).outcome,
+      "rejected",
+    );
+    assert.equal(requests.length, callsBeforeShortAppeal);
+    const configuredBanApiKey = process.env.BAN_API_KEY;
+    delete process.env.BAN_API_KEY;
+    const callsBeforeMissingKey = requests.length;
+    assert.equal(
+      (await submitAppeal("+2349058727403")).outcome,
+      "rejected",
+    );
+    assert.equal(requests.length, callsBeforeMissingKey);
+    process.env.BAN_API_KEY = configuredBanApiKey;
+    mockAppealPayload = { error: "Invalid phone" };
+    mockAppealHttpStatus = 400;
+    assert.equal(
+      (await submitAppeal("+2349058727403")).message,
+      "The appeal API rejected the phone number.",
+    );
+    mockAppealPayload = {
+      error: "Appeal text must be at least 10 characters",
+    };
+    assert.equal(
+      (await submitAppeal("+2349058727403")).message,
+      "The appeal API rejected the appeal text.",
+    );
+    mockAppealPayload = { error: "Unauthorized" };
+    mockAppealHttpStatus = 401;
+    assert.match(
+      (await submitAppeal("+2349058727403")).message,
+      /authentication failed/i,
+    );
+    mockAppealPayload = { message: "unexpected shape" };
+    mockAppealHttpStatus = 200;
+    assert.equal(
+      (await submitAppeal("+2349058727403")).outcome,
+      "uncertain",
+    );
+    globalThis.fetch = async () => {
+      throw Object.assign(new Error("network timeout"), { name: "AbortError" });
+    };
+    assert.equal(
+      (await submitAppeal("+2349058727403")).outcome,
+      "uncertain",
+    );
+    globalThis.fetch = async (input, options = {}) => {
+      requests.push({ url: new URL(String(input)), options });
+      const url = String(input);
+      const payload = url.includes("/appeal-submit")
+        ? mockAppealPayload
+        : url.includes("/appeal-status")
+          ? { status: "NO_APPEAL_OPENED", ban_time: "2026-10-14T11:14:54.000Z" }
+          : { banned: mockBanStatus, ban_type: "hard_ban" };
+      return new Response(JSON.stringify(payload), {
+        status: url.includes("/appeal-submit") ? mockAppealHttpStatus : 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
 
     for (const [slot, type] of [
       ["start", "animation"],
@@ -3775,14 +4334,79 @@ async function runSelfTests() {
     const firstProgress = editedResults.filter((call) =>
       call[3]?.includes("%</blockquote>"),
     );
-    assert.equal(firstProgress.length, 10);
-    assert.match(firstProgress.at(-1)[3], /██████████ 100%<\/blockquote>$/);
+    assert.equal(firstProgress.length, 1);
+    assert.match(loadingReplies[0][0], /█████░░░░░ 50%<\/blockquote>$/);
+    assert.match(firstProgress[0][3], /██████████ 100%<\/blockquote>$/);
     assert.ok(firstProgress.every((call) => call[4].parse_mode === "HTML"));
     assert.equal(resultMedia[0][0], "photo");
     assert.match(resultMedia[0][2].caption, /<blockquote>[\s\S]*ʙᴀɴɴᴇᴅ/);
     assert.equal(validateTelegramHtml(resultMedia[0][2].caption), true);
     assert.ok(resultMedia[0][2].reply_markup);
     assert.deepEqual(deletedLoadingMessages[0], [456, 901]);
+    const banCheckRecords = await testStore.read("ban_checks.json");
+    const reviewRecord = banCheckRecords.records.find(
+      (record) => record.appealRequest?.state === "ready",
+    );
+    assert.ok(reviewRecord);
+    assert.equal(reviewRecord.appealRequest.phone, "+2349058727403");
+    assert.equal(reviewRecord.appealRequest.messageId, 949);
+    const callbackMessage = {
+      message_id: 949,
+      chat: { id: 456, type: "private" },
+      caption: resultMedia[0][2].caption,
+      reply_markup: resultMedia[0][2].reply_markup,
+    };
+    const reviewEdits = [];
+    const reviewAnswers = [];
+    mockAppealPayload = {
+      success: true,
+      result: {
+        status: "IN_REVIEW",
+        ticket_id: null,
+        reason: null,
+        reason_url: null,
+      },
+    };
+    mockAppealHttpStatus = 200;
+    const reviewContext = {
+      from: { id: "test" },
+      chat: { id: 456, type: "private" },
+      callbackQuery: { message: callbackMessage },
+      telegram: {
+        editMessageCaption: async (...args) => {
+          reviewEdits.push(args);
+          callbackMessage.caption = args[3];
+          callbackMessage.reply_markup = args[4]?.reply_markup;
+          return true;
+        },
+        editMessageText: async (...args) => {
+          reviewEdits.push(args);
+          callbackMessage.text = args[3];
+          callbackMessage.reply_markup = args[4]?.reply_markup;
+          return true;
+        },
+      },
+      answerCbQuery: async (...args) => reviewAnswers.push(args),
+    };
+    const appealRequestsBeforeCallback = requests.filter((request) =>
+      request.url.pathname.endsWith("/api/v2/appeal-submit"),
+    ).length;
+    await handleReviewCallback(reviewContext, reviewRecord.id);
+    const appealedRecord = await getBanCheckRecord(reviewRecord.id);
+    assert.equal(appealedRecord.appealRequest.state, "submitted");
+    assert.equal(appealedRecord.appealRequest.ticketId, null);
+    assert.match(callbackMessage.caption, /ᴀᴘᴘᴇᴀʟ sᴛᴀᴛᴜs: ɪɴ ʀᴇᴠɪᴇᴡ/);
+    assert.match(callbackMessage.caption, /14 ᴏᴄᴛᴏʙᴇʀ 2026/);
+    assert.deepEqual(callbackMessage.reply_markup, { inline_keyboard: [] });
+    assert.match(reviewAnswers.at(-1)[0], /under review/i);
+    await handleReviewCallback(reviewContext, reviewRecord.id);
+    assert.equal(
+      requests.filter((request) =>
+        request.url.pathname.endsWith("/api/v2/appeal-submit"),
+      ).length,
+      appealRequestsBeforeCallback + 1,
+    );
+    assert.equal(reviewEdits.length, 2);
     const mediaFailureResult = await sendConfiguredResultMedia(
       {
         replyWithPhoto: async () => {
@@ -3799,7 +4423,7 @@ async function runSelfTests() {
     await runBanCheck(banCheckContext, `? ${banCheckContext.message.text}`);
     assert.equal(resultMedia[1][0], "video");
     assert.match(resultMedia[1][2].caption, /ɴᴏᴛ ʙᴀɴɴᴇᴅ/);
-    assert.ok(resultMedia[1][2].reply_markup);
+    assert.equal(resultMedia[1][2].reply_markup, undefined);
     assert.deepEqual(deletedLoadingMessages[1], [456, 902]);
     await testStore.update("media.json", (media) => {
       media.unbanned = null;
@@ -3855,7 +4479,7 @@ async function runSelfTests() {
       },
     };
     await runBanCheck(failedCheckContext, "? +2349058727403");
-    assert.match(failedCheckEdits[0][3], /could not be verified/i);
+    assert.match(failedCheckEdits.at(-1)[3], /could not be verified/i);
     globalThis.fetch = async (_input, options = {}) =>
       new Promise((resolve, reject) => {
         options.signal.addEventListener(
