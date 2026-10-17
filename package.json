@@ -1,0 +1,14 @@
+{
+  "name": "12th-realm-ban-checker",
+  "version": "1.0.0",
+  "description": "𓋹 12TH REALM Ban Checker Telegram Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "libphonenumber-js": "^1.11.20",
+    "dotenv": "^16.4.7"
+  }
+}
